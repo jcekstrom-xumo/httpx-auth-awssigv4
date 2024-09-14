@@ -95,7 +95,26 @@ class SigV4Auth:
         signing = sign(service, "aws4_request")
         return signing
 
-    def get_canonical_request(self, request: Request, timestamp: str) -> str:
+    def get_signed_headers(self, request: Request):
+        """ Find the headers to sign
+
+        Args:
+            request (Request): https Request Object
+
+        Returns:
+            list: headers to sign
+            str: headers to sign joined but ";"
+        """
+        # Add the Host header and all the "x-amz-" headers
+        signed_headers = sorted(
+            filter(
+                lambda h: h.startswith('x-amz-') or h == 'host',
+                map(lambda h_key: h_key.lower(), request.headers.keys()),
+            )
+        )
+        return (signed_headers, ';'.join(signed_headers))
+
+    def get_canonical_request(self, request: Request, timestamp: str, payload_hash: str) -> str:
         """Creates a canonical request.
 
         This function returns information from your request in a standardized (canonical) format. Read more about
@@ -110,25 +129,35 @@ class SigV4Auth:
         Returns:
             str: request infromation in a canonical format
         """
-        canonical_uri = request.url.path
         canonical_querystring = request.url.query.decode("utf-8")
-        canonical_headers = f"host:{request.url.host}\nx-amz-date:{timestamp}\n"
+        canonical_uri = request.url.path
+        headers_to_sign, signed_headers = self.get_signed_headers(request)
 
-        if request.content:
-            payload_hash = hashlib.sha256(request.content).hexdigest()
-        else:
-            payload_hash = hashlib.sha256(("").encode("utf-8")).hexdigest()
-
-        canonical_request = (
-            f"{request.method}\n{canonical_uri}\n{canonical_querystring}\n"
-            f"{canonical_headers}\n{self._signed_headers}\n{payload_hash}"
+        # Create the canonical headers and signed headers. Header names
+        # must be trimmed and lowercase, and sorted in code point order from
+        # low to high. Note that there is a trailing \n.
+        canonical_headers = ''.join(map(lambda h: ":".join((h, request.headers[h])) + '\n', headers_to_sign))
+                
+        # Combine elements to create canonical request
+        canonical_request = '\n'.join(
+            [
+                request.method,
+                canonical_uri,
+                canonical_querystring,
+                canonical_headers,
+                signed_headers,
+                payload_hash,
+            ]
         )
+
+
         return canonical_request
 
-    def get_authorization_header(self, credential_scope: str, signature: str) -> str:
+    def get_authorization_header(self, request: Request, credential_scope: str, signature: str) -> str:
         """Constructs "Authorization" header to include in the request.
 
         Args:
+            request (Request): httpx Request object
             credential_scope (str): String that includes the date, the Region you are targeting, the service you are
                 requesting, and a termination string
             signature (str): calculated signature to include in Authorization header
@@ -136,9 +165,10 @@ class SigV4Auth:
         Returns:
             str: String to send under "Authorization" header
         """
+        _, signed_headers = self.get_signed_headers(request)
         return (
             f"{self._algorithm} Credential={self._access_key}/{credential_scope},"
-            f" SignedHeaders={self._signed_headers}, Signature={signature}"
+            f" SignedHeaders={signed_headers}, Signature={signature}"
         )
 
     def __call__(self, request: Request) -> Request:
@@ -155,8 +185,24 @@ class SigV4Auth:
         timestamp = current_time.strftime("%Y%m%dT%H%M%SZ")
         datestamp = current_time.strftime("%Y%m%d")  # Date w/o time, used in credential scope
 
+        # Add Headers to Request
+        if request.content:
+            payload_hash = hashlib.sha256(request.content).hexdigest()
+        else:
+            payload_hash = hashlib.sha256(("").encode("utf-8")).hexdigest()
+
+        headers = {
+            "X-Amz-Content-SHA256": payload_hash,
+            "X-Amz-Date": timestamp,
+        }
+
+        if self._token:
+            headers["X-Amz-Security-Token"] = self._token
+
+        request.headers.update(headers)
+
         # CREATE A CANONICAL REQUEST
-        canonical_request = self.get_canonical_request(request=request, timestamp=timestamp)
+        canonical_request = self.get_canonical_request(request=request, timestamp=timestamp, payload_hash=payload_hash)
 
         # CREATE THE STRING TO SIGN
 
@@ -172,15 +218,11 @@ class SigV4Auth:
 
         # ADD SIGNING INFORMATION TO THE REQUEST
 
-        authorization_header = self.get_authorization_header(credential_scope=credential_scope, signature=signature)
+        authorization_header = self.get_authorization_header(request=request, credential_scope=credential_scope, signature=signature)
 
         headers = {
-            "x-amz-date": timestamp,
             "Authorization": authorization_header,
         }
-
-        if self._token:
-            headers["X-Amz-Security-Token"] = self._token
 
         request.headers.update(headers)
 
